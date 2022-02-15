@@ -52,15 +52,11 @@ func GRPCInit() *PublicAPIService {
 	xcntnConn, err := grpc.Dial(*xcntnAddr, opts...)
 	if err != nil {
 		log.Fatalf("Fail to dial: %v", err)
-	} else {
-		log.Printf("Contnet connected...")
 	}
 
 	xuserConn, err := grpc.Dial(*xuserAddr, opts...)
 	if err != nil {
 		log.Fatalf("Fail to dial: %v", err)
-	} else {
-		log.Printf("User connected...")
 	}
 
 	return &PublicAPIService{
@@ -187,6 +183,8 @@ func (s *PublicAPIService) Ping(c *gin.Context) {
 
 func RestInit(papiService *PublicAPIService) {
 	r := gin.Default()
+	r.SetTrustedProxies(nil)
+
 	admin := r.Group("/admin", papiService.AuthUser)
 	{
 		admin.GET("/ping", papiService.PingAdmin)
