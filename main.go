@@ -2,56 +2,207 @@ package main
 
 import (
 	"context"
+	"crypto/rsa"
+	"crypto/x509"
+	"encoding/pem"
 	"flag"
+	"io/ioutil"
 	"log"
+	"net/http"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/golang-jwt/jwt"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
-	pb "github.com/dezkoat/xcntn/proto"
+	xcntn "github.com/dezkoat/xcntn/proto"
+	xuser "github.com/dezkoat/xuser/proto"
 )
 
 var (
-	serverAddr = flag.String("addr", "localhost:50001", "Server address")
+	xcntnAddr     = flag.String("cntn-addr", "localhost:50001", "Content Server address")
+	xuserAddr     = flag.String("user-addr", "localhost:50002", "User Server address")
+	publicKeyPath = flag.String("key", "./key/public.pem", "Public Key File Path used in User Credentials Authentication")
 )
 
-func grpcInit() {
+type PublicAPIService struct {
+	ContentConnection *grpc.ClientConn
+	Content           xcntn.ContentClient
+	UserConnection    *grpc.ClientConn
+	User              xuser.UserClient
+	UserPublicKey     *rsa.PublicKey
+}
+
+type LoginInfo struct {
+	Username string `json:"username" binding:"required"`
+	Password string `json:"password" binding:"required"`
+}
+
+type UserClaims struct {
+	*jwt.StandardClaims
+	Email string
+}
+
+func GRPCInit() *PublicAPIService {
 	var opts []grpc.DialOption
 	opts = append(opts, grpc.WithTransportCredentials(insecure.NewCredentials()))
 
-	conn, err := grpc.Dial(*serverAddr, opts...)
+	xcntnConn, err := grpc.Dial(*xcntnAddr, opts...)
 	if err != nil {
 		log.Fatalf("Fail to dial: %v", err)
 	} else {
-		log.Printf("Success dialing %v", *serverAddr)
+		log.Printf("Contnet connected...")
 	}
-	defer conn.Close()
+
+	xuserConn, err := grpc.Dial(*xuserAddr, opts...)
+	if err != nil {
+		log.Fatalf("Fail to dial: %v", err)
+	} else {
+		log.Printf("User connected...")
+	}
+
+	return &PublicAPIService{
+		ContentConnection: xcntnConn,
+		Content:           xcntn.NewContentClient(xcntnConn),
+		UserConnection:    xuserConn,
+		User:              xuser.NewUserClient(xuserConn),
+	}
+}
+
+func (s *PublicAPIService) ReadAndStorePublicKey() {
+	pub, err := ioutil.ReadFile(*publicKeyPath)
+	if err != nil {
+		log.Fatalf("Error reading file %v: %v", publicKeyPath, err)
+	}
+
+	pubPem, _ := pem.Decode(pub)
+	pubKey, err := x509.ParsePKIXPublicKey(pubPem.Bytes)
+	if err != nil {
+		log.Fatalf("Error reading public key %v", err)
+	}
+
+	s.UserPublicKey = pubKey.(*rsa.PublicKey)
+}
+
+func (s *PublicAPIService) AuthUser(c *gin.Context) {
+	if s.UserPublicKey == nil {
+		s.ReadAndStorePublicKey()
+	}
+
+	bearerToken := c.Request.Header["Authorization"]
+	if len(bearerToken) == 0 {
+		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
+			"message": "Authorization required",
+		})
+		return
+	}
+	if len(bearerToken) != 1 {
+		c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{
+			"message": "Unexpected error",
+		})
+		return
+	}
+
+	bearerTokens := strings.Split(bearerToken[0], " ")
+	if len(bearerTokens) != 2 {
+		c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{
+			"message": "Unexpected error",
+		})
+		return
+	}
+
+	_, err := jwt.ParseWithClaims(bearerTokens[1], &UserClaims{}, func(token *jwt.Token) (interface{}, error) {
+		return s.UserPublicKey, nil
+	})
+
+	if err != nil {
+		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
+			"message": "Invalid Credentials. Error: " + err.Error(),
+		})
+		return
+	}
+}
+
+func (s *PublicAPIService) Login(c *gin.Context) {
+	var login LoginInfo
+	c.BindJSON(&login)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	client := pb.NewContentClient(conn)
-	post, err := client.GetPost(ctx, &pb.GetPostRequest{Id: "1234"})
+	userToken, err := s.User.Login(
+		ctx,
+		&xuser.UserInfo{
+			Username: login.Username,
+			Password: login.Password,
+		},
+	)
 	if err != nil {
-		log.Fatalf("Error calling GetPost: %v", err)
-	} else {
-		log.Printf("%v: %v", post.Title, post.Text)
+		log.Printf("Error calling Login: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"message": "Unexpected Error",
+		})
+		return
 	}
 
+	c.JSON(http.StatusOK, gin.H{
+		"token": userToken.Token,
+	})
 }
 
-func restInit() {
-	r := gin.Default()
-	r.GET("/ping", func(c *gin.Context) {
-		c.JSON(200, gin.H{
-			"message": "pong",
+func (s *PublicAPIService) PingAdmin(c *gin.Context) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	post, err := s.Content.GetPost(ctx, &xcntn.GetPostRequest{Id: "1234"})
+	if err != nil {
+		log.Printf("Error calling GetPost: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"message": "Unexpected Error",
 		})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message": "Admin says: " + post.Title,
 	})
-	r.Run() // listen and serve on 0.0.0.0:8080 (for windows "localhost:8080")
+}
+
+func (s *PublicAPIService) Ping(c *gin.Context) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	post, err := s.Content.GetPost(ctx, &xcntn.GetPostRequest{Id: "1234"})
+	if err != nil {
+		log.Printf("Error calling GetPost: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"message": "Unexpected Error",
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message": post.Title,
+	})
+}
+
+func RestInit(papiService *PublicAPIService) {
+	r := gin.Default()
+	admin := r.Group("/admin", papiService.AuthUser)
+	{
+		admin.GET("/ping", papiService.PingAdmin)
+	}
+
+	r.POST("/login", papiService.Login)
+
+	r.GET("/ping", papiService.Ping)
+
+	r.Run()
 }
 
 func main() {
-	grpcInit()
-	restInit()
+	papiService := GRPCInit()
+	defer papiService.ContentConnection.Close()
+	defer papiService.UserConnection.Close()
+
+	RestInit(papiService)
 }

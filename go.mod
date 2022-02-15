@@ -4,7 +4,9 @@ go 1.17
 
 require (
 	github.com/dezkoat/xcntn v0.0.0-20220210181526-bc2be0c57081
+	github.com/dezkoat/xuser v0.0.0-20220215160642-8974ec1aa021
 	github.com/gin-gonic/gin v1.7.7
+	github.com/golang-jwt/jwt v3.2.2+incompatible
 	google.golang.org/grpc v1.44.0
 )
 
